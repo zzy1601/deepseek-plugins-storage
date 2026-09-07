@@ -30,7 +30,9 @@ const inject = [
 	"agents",
 	"settings",
 	"sessions",
-	"tools"
+	"tools",
+	"commands",
+	"llm"
 ];
 const RoutineBudgetSchema = z.object({
 	maxTurns: z.number().min(1).default(void 0),
@@ -48,6 +50,7 @@ const RoutineSchema = z.object({
 	needsApproval: z.boolean().default(false),
 	budget: RoutineBudgetSchema.default(void 0),
 	reportSessionId: z.string().default(void 0),
+	direct: z.boolean().default(false),
 	failStreak: z.number().min(0).default(0),
 	lastRun: z.object({
 		at: z.string().required(),
@@ -395,8 +398,115 @@ function apply(ctx) {
 		}
 		return detail;
 	}
+	/** P0-2：纯生成例程的系统提示——独立于会话 persona，直接输出结论、不请求工具。 */
+	const DIRECT_SYSTEM_PROMPT = "你是后台例程执行器。按任务说明直接输出简洁的最终结论；不要请求工具、不要反问。";
+	/**
+	* P0-2：纯生成例程的缓存中立单次直调——ctx.llm.stream 一次调用，不建常驻 agent、
+	* 不 followup、不 flush、不写会话事件，后续请求的 provider 缓存前缀不受影响。
+	* 预算：maxSeconds 用 abort 超时、maxTokens 用 usage 实时拦截；maxTurns 天然为 1（不适用）。
+	*/
+	async function runTurnDirect(routine, runId, onProgress) {
+		const selection = selectionFor(routine);
+		const prompt = routine.prompt && routine.prompt.trim() ? `${routine.prompt}\n\n本次运行编号：${runId}。只输出结论。` : `【例程 ${routine.name}】请输出本周期例行结论，不超过 200 字。\n\n本次运行编号：${runId}。`;
+		const budget = routine.budget;
+		const startedAt = Date.now();
+		const abort = new AbortController();
+		let timedOut = false;
+		const timeoutHandle = budget?.maxSeconds !== void 0 ? setTimeout(() => {
+			timedOut = true;
+			abort.abort();
+		}, budget.maxSeconds * 1e3) : void 0;
+		let text = "";
+		let tokens = 0;
+		let finish;
+		let overReason = "";
+		const checkOver = () => {
+			if (!budget) return "";
+			if (timedOut) return `时长超限（${budget.maxSeconds}s）`;
+			if (budget.maxTokens !== void 0 && tokens > budget.maxTokens) return `token 超限（${tokens}/${budget.maxTokens}）`;
+			return "";
+		};
+		try {
+			const options = {
+				provider: selection.provider,
+				model: selection.model,
+				system: DIRECT_SYSTEM_PROMPT,
+				messages: [{
+					role: "user",
+					content: [{
+						type: "text",
+						text: prompt
+					}]
+				}],
+				signal: abort.signal
+			};
+			for await (const chunk of ctx.llm.stream(options)) {
+				switch (chunk.type) {
+					case "text-delta":
+						text += chunk.text;
+						break;
+					case "usage":
+						tokens = chunk.usage.totalTokens ?? chunk.usage.inputTokens + chunk.usage.outputTokens;
+						break;
+					case "finish": finish = chunk.reason;
+				}
+				onProgress({
+					turns: 1,
+					tokens,
+					elapsedMs: Date.now() - startedAt
+				});
+				overReason = checkOver();
+				if (overReason) {
+					abort.abort();
+					break;
+				}
+			}
+			overReason = overReason || checkOver();
+			if (overReason) return {
+				status: "budget",
+				result: "",
+				turns: 1,
+				tokens,
+				reason: overReason,
+				detail: []
+			};
+			if (finish !== void 0) {
+				if (finish.kind === "error" || finish.kind === "aborted") throw new Error(`${finish.kind}: ${finish.failure.message}`);
+				if (finish.kind === "max-tokens") throw new Error("输出在 token 上限被截断");
+			}
+			return {
+				status: "done",
+				result: text.trim() || "（无文本输出）",
+				turns: 1,
+				tokens,
+				reason: "",
+				detail: []
+			};
+		} catch (err) {
+			overReason = overReason || checkOver();
+			if (overReason) return {
+				status: "budget",
+				result: "",
+				turns: 1,
+				tokens,
+				reason: overReason,
+				detail: []
+			};
+			return {
+				status: "error",
+				result: "",
+				turns: 1,
+				tokens,
+				reason: err instanceof Error ? err.message : String(err),
+				detail: []
+			};
+		} finally {
+			if (timeoutHandle) clearTimeout(timeoutHandle);
+		}
+	}
 	/** 跑一轮并汇总：运行中经 onProgress 实时上报进度（驱动面板 + 实时预算拦截）。 */
 	async function runTurn(routine, runId, onProgress) {
+		if (routine.direct) return runTurnDirect(routine, runId, onProgress);
 		const selection = selectionFor(routine);
 		const agent = await ensureAgent(routine.id, selection);
 		const prompt = routine.prompt && routine.prompt.trim() ? `${routine.prompt}\n\n本次运行编号：${runId}。只输出结论。` : `【例程 ${routine.name}】请输出本周期例行结论，不超过 200 字。\n\n本次运行编号：${runId}。`;
@@ -742,6 +852,7 @@ function apply(ctx) {
 		needsApproval: r.needsApproval ?? false,
 		budget: r.budget ?? null,
 		reportSessionId: r.reportSessionId ?? null,
+		direct: r.direct ?? false,
 		failStreak: r.failStreak ?? 0,
 		lastRun: r.lastRun ?? null
 	});
@@ -807,6 +918,11 @@ function apply(ctx) {
 				type: "string",
 				default: "",
 				description: "汇报目标会话 id（空=仅运行日志）"
+			},
+			direct: {
+				type: "boolean",
+				default: false,
+				description: "true=纯生成直调（缓存中立，不用工具）；false=agent turn（支持工具）"
 			}
 		},
 		output: {
@@ -839,7 +955,8 @@ function apply(ctx) {
 					...a.maxTokens != null ? { maxTokens: a.maxTokens } : {},
 					...a.maxSeconds != null ? { maxSeconds: a.maxSeconds } : {}
 				} : void 0,
-				reportSessionId: a.reportSessionId ? String(a.reportSessionId) : void 0
+				reportSessionId: a.reportSessionId ? String(a.reportSessionId) : void 0,
+				direct: a.direct === true
 			};
 			writeRoutines([...sec.routines, routine]);
 			return {
@@ -906,6 +1023,11 @@ function apply(ctx) {
 				type: "boolean",
 				default: false,
 				description: "true=清空该例程全部预算上限"
+			},
+			direct: {
+				type: "boolean",
+				default: null,
+				description: "true=纯生成直调（缓存中立）；false=agent turn；null=不变"
 			}
 		},
 		output: {
@@ -932,6 +1054,7 @@ function apply(ctx) {
 				if (a.prompt !== void 0 && a.prompt !== null) patch.prompt = String(a.prompt).slice(0, 4e3);
 				if (a.enabled === true || a.enabled === false) patch.enabled = a.enabled;
 				if (a.needsApproval === true || a.needsApproval === false) patch.needsApproval = a.needsApproval;
+				if (a.direct === true || a.direct === false) patch.direct = a.direct;
 				if (a.reportSessionId !== void 0 && a.reportSessionId !== "") patch.reportSessionId = String(a.reportSessionId);
 				if (a.resetBudget) delete patch.budget;
 				else if (a.maxTurns !== void 0 && a.maxTurns !== null || a.maxTokens !== void 0 && a.maxTokens !== null || a.maxSeconds !== void 0 && a.maxSeconds !== null || r.budget) {
@@ -1085,8 +1208,67 @@ function apply(ctx) {
 			};
 		}
 	}));
+	ctx.effect(() => ctx.commands.register({
+		name: "routine-list",
+		description: "列出 dsh-grok-bot 的全部后台例程及最近一次运行状态",
+		recordInput: false,
+		handler: () => {
+			const routines = readSection().routines;
+			if (routines.length === 0) return {
+				kind: "success",
+				text: "当前没有配置任何后台例程。"
+			};
+			return {
+				kind: "success",
+				text: routines.map(viewRoutine).map((r) => `• ${r.name}（${r.id}）\n  ${r.schedule} · ${r.enabled ? "启用" : "停用"}` + (r.direct ? " · 直调" : "") + (r.lastRun ? ` · 上次 ${String(r.lastRun.at).slice(5, 16)} ${r.lastRun.status}` : " · 从未运行") + (r.failStreak ? ` · 连败 ${r.failStreak}` : "")).join("\n")
+			};
+		}
+	}));
+	ctx.effect(() => ctx.commands.register({
+		name: "routine-run",
+		description: "立即运行指定后台例程（不等 cron）",
+		input: { hint: "例程 id（见 /routine-list）" },
+		handler: (invocation) => {
+			const id = invocation.rawInput.trim();
+			if (!id) return {
+				kind: "error",
+				text: "请提供例程 id，如 /routine-run r-digest（用 /routine-list 查看全部 id）。"
+			};
+			const routine = readSection().routines.find((r) => r.id === id);
+			if (!routine) return {
+				kind: "error",
+				text: `找不到例程 ${id}。可用 id：${readSection().routines.map((r) => r.id).join("、")}`
+			};
+			dispatchRoutine({
+				...routine,
+				enabled: true
+			}, "trigger");
+			return {
+				kind: "success",
+				text: `已触发例程「${routine.name}」（后台运行）。完成后用 /routine-list 查看 lastRun。`
+			};
+		}
+	}));
+	ctx.effect(() => ctx.commands.register({
+		name: "routine-status",
+		description: "查看正在运行（排队/审批中/运行中）的后台例程及实时预算进度",
+		recordInput: false,
+		handler: () => {
+			const runs = Array.from(activeRuns.values());
+			if (runs.length === 0) return {
+				kind: "success",
+				text: "当前没有正在运行的后台例程。"
+			};
+			return {
+				kind: "success",
+				text: runs.map((r) => `• ${r.name}（${r.status}）进度 ${r.progress.turns} 轮 / ${r.progress.tokens} token / ${Math.round(r.progress.elapsedMs / 1e3)}s`).join("\n")
+			};
+		}
+	}));
 	const tick = Math.max(10, readSection().intervalSeconds || 60);
-	guardedUpdate(activeScope, { runs: [] });
+	ctx.effect(() => {
+		guardedUpdate(activeScope, { runs: [] });
+	});
 	const timer = ctx.interval(heartbeat, tick * 1e3);
 	ctx.on("dispose", () => {
 		timer.dispose();

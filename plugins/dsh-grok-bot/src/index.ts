@@ -18,9 +18,10 @@ import {
   type ModelSelection,
   type ModelSelectionRef,
 } from '@deepseek-ai/dsh-agent'
-import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createAssistantMessage, createUserMessage, type FinishReason, type GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
 
 /** 跨 0.1.1/0.1.2 的会话事件快照读取：0.1.2 移除 events getter，改用 snapshotEvents()。 */
 const sessionEvents = (s: { events?: readonly SessionEvent[]; snapshotEvents?: () => readonly SessionEvent[] }): readonly SessionEvent[] =>
@@ -32,7 +33,7 @@ const guardedUpdate = (scope: { update(patch: unknown): unknown }, patch: unknow
 }
 
 export const name = 'dsh-grok-bot'
-export const inject = ['timer', 'agents', 'settings', 'sessions', 'tools'] as const
+export const inject = ['timer', 'agents', 'settings', 'sessions', 'tools', 'commands', 'llm'] as const
 
 /** ============ 数据模型（schemastery → settings.yaml） ============ */
 
@@ -63,6 +64,8 @@ interface Routine {
   budget?: RoutineBudget
   /** M2：汇报目标会话 id；缺省不汇报（结果仅进运行日志）。 */
   reportSessionId?: string
+  /** P0-2：true = 走 ctx.llm.stream 单次直调（缓存中立，不用工具、不建常驻 agent）；false = 走 agent turn（支持工具）。 */
+  direct?: boolean
   /** M3：连续失败次数（error/timeout/budget 累计；done 清零）。驱动指数退避。 */
   failStreak?: number
   lastRun?: { at: string; runId: string; status: string; result: string; turns: number }
@@ -79,6 +82,7 @@ const RoutineSchema = z.object({
   needsApproval: z.boolean().default(false),
   budget: RoutineBudgetSchema.default(undefined),
   reportSessionId: z.string().default(undefined),
+  direct: z.boolean().default(false),
   failStreak: z.number().min(0).default(0),
   lastRun: z.object({
     at: z.string().required(),
@@ -467,12 +471,84 @@ export function apply(ctx: Context): void {
     return detail
   }
 
+  /** P0-2：纯生成例程的系统提示——独立于会话 persona，直接输出结论、不请求工具。 */
+  const DIRECT_SYSTEM_PROMPT = '你是后台例程执行器。按任务说明直接输出简洁的最终结论；不要请求工具、不要反问。'
+
+  /**
+   * P0-2：纯生成例程的缓存中立单次直调——ctx.llm.stream 一次调用，不建常驻 agent、
+   * 不 followup、不 flush、不写会话事件，后续请求的 provider 缓存前缀不受影响。
+   * 预算：maxSeconds 用 abort 超时、maxTokens 用 usage 实时拦截；maxTurns 天然为 1（不适用）。
+   */
+  async function runTurnDirect(
+    routine: Routine,
+    runId: string,
+    onProgress: (out: { turns: number; tokens: number; elapsedMs: number }) => void,
+  ): Promise<{ status: string; result: string; turns: number; tokens: number; reason: string; detail: RunDetailItem[] }> {
+    const selection = selectionFor(routine)
+    const prompt = routine.prompt && routine.prompt.trim()
+      ? `${routine.prompt}\n\n本次运行编号：${runId}。只输出结论。`
+      : `【例程 ${routine.name}】请输出本周期例行结论，不超过 200 字。\n\n本次运行编号：${runId}。`
+    const budget = routine.budget
+    const startedAt = Date.now()
+    const abort = new AbortController()
+    let timedOut = false
+    const timeoutHandle = budget?.maxSeconds !== undefined
+      ? setTimeout(() => { timedOut = true; abort.abort() }, budget.maxSeconds * 1000)
+      : undefined
+    let text = ''
+    let tokens = 0
+    let finish: FinishReason | undefined
+    let overReason = ''
+    const checkOver = (): string => {
+      if (!budget) return ''
+      if (timedOut) return `时长超限（${budget.maxSeconds}s）`
+      if (budget.maxTokens !== undefined && tokens > budget.maxTokens) return `token 超限（${tokens}/${budget.maxTokens}）`
+      return ''
+    }
+    try {
+      const options: GenerateOptions = {
+        provider: selection.provider,
+        model: selection.model,
+        system: DIRECT_SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }] as unknown as GenerateOptions['messages'],
+        signal: abort.signal,
+      }
+      for await (const chunk of ctx.llm.stream(options)) {
+        switch (chunk.type) {
+          case 'text-delta': text += chunk.text; break
+          case 'usage': tokens = chunk.usage.totalTokens ?? (chunk.usage.inputTokens + chunk.usage.outputTokens); break
+          case 'finish': finish = chunk.reason; break
+          default: break
+        }
+        onProgress({ turns: 1, tokens, elapsedMs: Date.now() - startedAt })
+        overReason = checkOver()
+        if (overReason) { abort.abort(); break }
+      }
+      overReason = overReason || checkOver()
+      if (overReason) return { status: 'budget', result: '', turns: 1, tokens, reason: overReason, detail: [] }
+      if (finish !== undefined) {
+        if (finish.kind === 'error' || finish.kind === 'aborted') {
+          throw new Error(`${finish.kind}: ${finish.failure.message}`)
+        }
+        if (finish.kind === 'max-tokens') throw new Error('输出在 token 上限被截断')
+      }
+      return { status: 'done', result: text.trim() || '（无文本输出）', turns: 1, tokens, reason: '', detail: [] }
+    } catch (err) {
+      overReason = overReason || checkOver()
+      if (overReason) return { status: 'budget', result: '', turns: 1, tokens, reason: overReason, detail: [] }
+      return { status: 'error', result: '', turns: 1, tokens, reason: err instanceof Error ? err.message : String(err), detail: [] }
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle)
+    }
+  }
+
   /** 跑一轮并汇总：运行中经 onProgress 实时上报进度（驱动面板 + 实时预算拦截）。 */
   async function runTurn(
     routine: Routine,
     runId: string,
     onProgress: (out: { turns: number; tokens: number; elapsedMs: number }) => void,
   ): Promise<{ status: string; result: string; turns: number; tokens: number; reason: string; detail: RunDetailItem[] }> {
+    if (routine.direct) return runTurnDirect(routine, runId, onProgress)
     const selection = selectionFor(routine)
     const agent = await ensureAgent(routine.id, selection)
     const prompt = routine.prompt && routine.prompt.trim()
@@ -721,6 +797,7 @@ export function apply(ctx: Context): void {
     prompt: r.prompt, provider: r.provider ?? null, model: r.model ?? null,
     needsApproval: r.needsApproval ?? false, budget: r.budget ?? null,
     reportSessionId: r.reportSessionId ?? null,
+    direct: r.direct ?? false,
     failStreak: r.failStreak ?? 0,
     lastRun: r.lastRun ?? null,
   })
@@ -746,6 +823,7 @@ export function apply(ctx: Context): void {
       maxTokens: { type: 'number', default: null, description: '预算：token 上限（null=不限）' },
       maxSeconds: { type: 'number', default: null, description: '预算：时长上限秒（null=不限）' },
       reportSessionId: { type: 'string', default: '', description: '汇报目标会话 id（空=仅运行日志）' },
+      direct: { type: 'boolean', default: false, description: 'true=纯生成直调（缓存中立，不用工具）；false=agent turn（支持工具）' },
     },
     output: { schema: { type: 'object', additionalProperties: false, properties: { id: { type: 'string' }, count: { type: 'number' } } },
       render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }] },
@@ -755,7 +833,7 @@ export function apply(ctx: Context): void {
       const a = args as {
         name: string; schedule?: string; prompt?: string
         needsApproval?: boolean; maxTurns?: number | null; maxTokens?: number | null
-        maxSeconds?: number | null; reportSessionId?: string
+        maxSeconds?: number | null; reportSessionId?: string; direct?: boolean
       }
       const routine: Routine = {
         id, name: String(a.name).slice(0, 60),
@@ -771,6 +849,7 @@ export function apply(ctx: Context): void {
             }
           : undefined,
         reportSessionId: a.reportSessionId ? String(a.reportSessionId) : undefined,
+        direct: a.direct === true,
       }
       writeRoutines([...sec.routines, routine])
       return { id, count: sec.routines.length + 1 }
@@ -792,6 +871,7 @@ export function apply(ctx: Context): void {
       maxSeconds: { type: 'number', default: null, description: '预算：时长上限秒（null=不变）' },
       reportSessionId: { type: 'string', default: '', description: '汇报目标会话 id（空=仅运行日志）' },
       resetBudget: { type: 'boolean', default: false, description: 'true=清空该例程全部预算上限' },
+      direct: { type: 'boolean', default: null, description: 'true=纯生成直调（缓存中立）；false=agent turn；null=不变' },
     },
     output: { schema: { type: 'object', additionalProperties: false, properties: { updated: { type: 'boolean' } } },
       render: (_m, v) => [{ type: 'text', text: JSON.stringify(v) }] },
@@ -806,12 +886,14 @@ export function apply(ctx: Context): void {
           name?: string; schedule?: string; prompt?: string | null; enabled?: boolean | null
           needsApproval?: boolean | null; maxTurns?: number | null; maxTokens?: number | null
           maxSeconds?: number | null; reportSessionId?: string; resetBudget?: boolean
+          direct?: boolean | null
         }
         if (a.name !== undefined && a.name !== '') patch.name = String(a.name).slice(0, 60)
         if (a.schedule !== undefined && a.schedule !== '') patch.schedule = String(a.schedule).slice(0, 64)
         if (a.prompt !== undefined && a.prompt !== null) patch.prompt = String(a.prompt).slice(0, 4000)
         if (a.enabled === true || a.enabled === false) patch.enabled = a.enabled
         if (a.needsApproval === true || a.needsApproval === false) patch.needsApproval = a.needsApproval
+        if (a.direct === true || a.direct === false) patch.direct = a.direct
         if (a.reportSessionId !== undefined && a.reportSessionId !== '') patch.reportSessionId = String(a.reportSessionId)
         // 预算：reset 优先；否则按字段合并
         if (a.resetBudget) {
@@ -889,10 +971,57 @@ export function apply(ctx: Context): void {
     },
   }))
 
+  // ---------- 斜杠命令（P0-3：全局手动触发，绕开 trigger token + 心跳往返） ----------
+  ctx.effect(() => ctx.commands.register({
+    name: 'routine-list',
+    description: '列出 dsh-grok-bot 的全部后台例程及最近一次运行状态',
+    recordInput: false,
+    handler: () => {
+      const routines = readSection().routines
+      if (routines.length === 0) return { kind: 'success', text: '当前没有配置任何后台例程。' }
+      const lines = routines.map(viewRoutine).map((r) =>
+        `• ${r.name}（${r.id}）\n  ${r.schedule} · ${r.enabled ? '启用' : '停用'}`
+        + (r.direct ? ' · 直调' : '')
+        + (r.lastRun ? ` · 上次 ${String(r.lastRun.at).slice(5, 16)} ${r.lastRun.status}` : ' · 从未运行')
+        + (r.failStreak ? ` · 连败 ${r.failStreak}` : ''))
+      return { kind: 'success', text: lines.join('\n') }
+    },
+  }))
+
+  ctx.effect(() => ctx.commands.register({
+    name: 'routine-run',
+    description: '立即运行指定后台例程（不等 cron）',
+    input: { hint: '例程 id（见 /routine-list）' },
+    handler: (invocation: CommandInvocation): CommandResult => {
+      const id = invocation.rawInput.trim()
+      if (!id) return { kind: 'error', text: '请提供例程 id，如 /routine-run r-digest（用 /routine-list 查看全部 id）。' }
+      const routine = readSection().routines.find((r) => r.id === id)
+      if (!routine) return { kind: 'error', text: `找不到例程 ${id}。可用 id：${readSection().routines.map((r) => r.id).join('、')}` }
+      void dispatchRoutine({ ...routine, enabled: true }, 'trigger')
+      return { kind: 'success', text: `已触发例程「${routine.name}」（后台运行）。完成后用 /routine-list 查看 lastRun。` }
+    },
+  }))
+
+  ctx.effect(() => ctx.commands.register({
+    name: 'routine-status',
+    description: '查看正在运行（排队/审批中/运行中）的后台例程及实时预算进度',
+    recordInput: false,
+    handler: () => {
+      const runs = Array.from(activeRuns.values())
+      if (runs.length === 0) return { kind: 'success', text: '当前没有正在运行的后台例程。' }
+      const lines = runs.map((r) =>
+        `• ${r.name}（${r.status}）进度 ${r.progress.turns} 轮 / ${r.progress.tokens} token / ${Math.round(r.progress.elapsedMs / 1000)}s`)
+      return { kind: 'success', text: lines.join('\n') }
+    },
+  }))
+
   // ---------- 启动 ----------
   const tick = Math.max(10, readSection().intervalSeconds || 60)
   // 清空上次进程遗留的 grok-active 快照（内存注册表重启即空，磁盘副本不再有意义）。
-  guardedUpdate(activeScope, { runs: [] })
+  // 必须延后到 effect：settings register 的真正注册同样在 effect 里延后生效，
+  // apply 同步链上的写会撞 "namespace not registered" 被 guardedUpdate 吞掉（静默失败，
+  // stale running 快照因此跨重启存活）。
+  ctx.effect(() => { guardedUpdate(activeScope, { runs: [] }) })
   const timer = ctx.interval(heartbeat, tick * 1000)
   ctx.on('dispose', () => { timer.dispose() })
   logger.info(`dsh-grok-bot loaded (routines + live status, tick ${tick}s, max concurrent ${MAX_RUNS_CONCURRENT})`)
