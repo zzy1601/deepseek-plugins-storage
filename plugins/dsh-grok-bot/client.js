@@ -64,20 +64,21 @@ window.__ModuleLoader__.load({
 			const [, setNowTick] = (0, react.useState)(0);
 			const rootRef = (0, react.useRef)(null);
 			(0, _deepseek_ai_dsh_client_ui_primitives.useDismissOnOutsidePointer)(rootRef, open, setOpen);
-			(0, react.useEffect)(() => {
-				const handle = setInterval(() => {
-					setNowTick((v) => v + 1);
-				}, 1e3);
-				return () => {
-					clearInterval(handle);
-				};
-			}, []);
 			const ready = section.status === "ready";
 			const routines = ready && section.value ? section.value.routines : void 0;
 			const history = runSection.status === "ready" && runSection.value ? runSection.value.runs : void 0;
 			const approvalsData = approvalSection.status === "ready" && approvalSection.value ? approvalSection.value.requests : void 0;
 			const live = activeSection.status === "ready" && activeSection.value ? activeSection.value.runs : void 0;
 			const pending = (approvalsData ?? []).filter((r) => r.status === "pending");
+			(0, react.useEffect)(() => {
+				if (!open || pending.length === 0) return;
+				const handle = setInterval(() => {
+					setNowTick((v) => v + 1);
+				}, 1e3);
+				return () => {
+					clearInterval(handle);
+				};
+			}, [open, pending.length]);
 			const count = routines?.length ?? 0;
 			const runNow = (id) => {
 				setQueuedId(id);

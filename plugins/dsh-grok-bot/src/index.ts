@@ -220,7 +220,9 @@ function parseField(raw: string, max: number): Field {
   if (raw === '') return segs
   for (const part of raw.split(',')) {
     const [range, stepRaw] = part.split('/')
-    const step = stepRaw ? Number(stepRaw) : 1
+    // `/step` 校验：0、负数、NaN 一律归一为 1，避免取模恒不匹配（如 */0、*/foo）
+    let step = stepRaw ? Number(stepRaw) : 1
+    if (!Number.isFinite(step) || step <= 0) step = 1
     if (range === '*') { segs.push({ from: 0, to: max, step }); continue }
     const [a, b] = range.split('-').map(Number)
     const from = Number(a)
@@ -697,6 +699,14 @@ export function apply(ctx: Context): void {
             recordJsonl(denied)
             runSectionUpdate(denied)
             void reportTo(routine, denied)
+            // 落 lastRun=denied：调度/限频（MIN_REPEAT_MS、退避）才能感知本次决策，
+            // 否则 intervalSeconds 很小时同一例程会被反复拉起审批
+            try {
+              const sec = readSection()
+              writeRoutines(sec.routines.map((r) => r.id === id
+                ? { ...r, lastRun: { at: denied.at, runId, status: 'denied', result: denied.reason, turns: 0 } }
+                : r))
+            } catch { /* best effort */ }
             return { status: 'denied' }
           }
         }
@@ -753,6 +763,14 @@ export function apply(ctx: Context): void {
       try { writeApprovals(changed) } catch { /* settings 未就绪时下轮重试 */ }
     }
   }
+  /** 与 now 处于同一分钟（心跳一分钟内可能多次扫描，cron 分钟粒度下防重复派发）。 */
+  function sameMinute(atIso: string, now: Date): boolean {
+    const t = new Date(atIso).getTime()
+    if (!Number.isFinite(t)) return false
+    const minuteStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), now.getMinutes(), 0, 0).getTime()
+    return t >= minuteStart
+  }
+
   /** 一次心跳的调度扫描；耗时只在扫描本身，run 的审批/执行都在后台，靠信号量限流。 */
   async function heartbeat(): Promise<void> {
     if (busy) return
@@ -781,6 +799,8 @@ export function apply(ctx: Context): void {
           } else if (since < MIN_REPEAT_MS) {
             continue
           }
+          // 同分钟不重复派发（cron 分钟粒度，intervalSeconds < 60 时一分钟内可能多次命中）
+          if (sameMinute(r.lastRun.at, now)) continue
         }
         if (cronMatches(r.schedule, now)) void dispatchRoutine(r, 'heartbeat')
       }

@@ -59,7 +59,8 @@ export interface RunEntry {
   status: 'done' | 'error' | 'timeout' | 'budget' | 'denied'
   result: string
   turns: number
-  reason?: string
+  // 与 host RunsSchema 一致：reason 恒有值（缺省为空串）
+  reason: string
   /** M3：该轮结束后的例程连败计数（>0 驱动退避）。 */
   failStreak?: number
   /** M4：结构化运行轨迹（bot-logs 详情）。 */

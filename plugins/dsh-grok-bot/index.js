@@ -136,7 +136,8 @@ function parseField(raw, max) {
 	if (raw === "") return segs;
 	for (const part of raw.split(",")) {
 		const [range, stepRaw] = part.split("/");
-		const step = stepRaw ? Number(stepRaw) : 1;
+		let step = stepRaw ? Number(stepRaw) : 1;
+		if (!Number.isFinite(step) || step <= 0) step = 1;
 		if (range === "*") {
 			segs.push({
 				from: 0,
@@ -723,6 +724,10 @@ function apply(ctx) {
 						recordJsonl(denied);
 						runSectionUpdate(denied);
 						reportTo(routine, denied);
+						try {
+							const sec = readSection();
+							writeRoutines(sec.routines.map((r) => r.id === id ? { ...r, lastRun: { at: denied.at, runId, status: "denied", result: denied.reason, turns: 0 } } : r));
+						} catch { }
 						return { status: "denied" };
 					}
 				}
@@ -809,6 +814,13 @@ function apply(ctx) {
 			writeApprovals(changed);
 		} catch {}
 	}
+	/** 与 now 处于同一分钟（心跳一分钟内可能多次扫描，cron 分钟粒度下防重复派发）。 */
+	function sameMinute(atIso, now) {
+		const t = new Date(atIso).getTime();
+		if (!Number.isFinite(t)) return false;
+		const minuteStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), now.getMinutes(), 0, 0).getTime();
+		return t >= minuteStart;
+	}
 	/** 一次心跳的调度扫描；耗时只在扫描本身，run 的审批/执行都在后台，靠信号量限流。 */
 	async function heartbeat() {
 		if (busy) return;
@@ -832,6 +844,7 @@ function apply(ctx) {
 					if (r.lastRun.status === "error") {
 						if (since < Math.min(tickMs * 2 ** Math.max(0, (r.failStreak ?? 1) - 1), BACKOFF_CAP_MS)) continue;
 					} else if (since < MIN_REPEAT_MS) continue;
+					if (sameMinute(r.lastRun.at, now)) continue;
 				}
 				if (cronMatches(r.schedule, now)) dispatchRoutine(r, "heartbeat");
 			}

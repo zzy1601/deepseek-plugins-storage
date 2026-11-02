@@ -88,12 +88,6 @@ export function GrokPanel({ bot, runs, approvals, active, t }: GrokPanelProps) {
   const rootRef = useRef<HTMLDivElement>(null)
   useDismissOnOutsidePointer(rootRef, open, setOpen)
 
-  // 审批卡倒计时：挂起时每秒重渲染，驱动剩余秒数
-  useEffect(() => {
-    const handle = setInterval(() => { setNowTick((v) => v + 1) }, 1_000)
-    return () => { clearInterval(handle) }
-  }, [])
-
   const ready = section.status === 'ready'
   const routines = ready && section.value ? section.value.routines : undefined
   const history = runSection.status === 'ready' && runSection.value ? runSection.value.runs : undefined
@@ -104,6 +98,13 @@ export function GrokPanel({ bot, runs, approvals, active, t }: GrokPanelProps) {
     ? activeSection.value.runs
     : undefined
   const pending = (approvalsData ?? []).filter((r) => r.status === 'pending')
+
+  // 审批卡倒计时：仅当面板打开且有挂起审批时每秒重渲染，驱动剩余秒数
+  useEffect(() => {
+    if (!open || pending.length === 0) return
+    const handle = setInterval(() => { setNowTick((v) => v + 1) }, 1_000)
+    return () => { clearInterval(handle) }
+  }, [open, pending.length])
   const count = routines?.length ?? 0
 
   const runNow = (id: string): void => {
